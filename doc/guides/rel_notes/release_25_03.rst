@@ -68,6 +68,10 @@ New Features
   * Added ability to option to configure receive packet fanout mode.
   * Added statistics for failed buffer allocation and missed packets.
 
+* **Updated Wangxun ngbe driver.**
+
+  * Added support for virtual function VF (ngbe_vf).
+
 
 Removed Items
 -------------
