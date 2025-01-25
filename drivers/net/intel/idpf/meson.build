@@ -7,7 +7,7 @@ if is_windows
     subdir_done()
 endif
 
-deps += ['net_iavf']
+includes += include_directories('../iavf/base')
 
 sources = files(
         'idpf_common_device.c',
@@ -18,7 +18,7 @@ sources = files(
         'idpf_rxtx.c',
 )
 
-if arch_subdir == 'x86'and cc_has_avx512 and dpdk_conf.has('RTE_NET_IAVF')
+if arch_subdir == 'x86' and cc_has_avx512
     cflags += ['-DCC_AVX512_SUPPORT']
     avx512_args = cflags + cc_avx512_flags
     if cc.has_argument('-march=skylake-avx512')
@@ -26,7 +26,7 @@ if arch_subdir == 'x86'and cc_has_avx512 and dpdk_conf.has('RTE_NET_IAVF')
     endif
     idpf_common_avx512_lib = static_library('idpf_common_avx512_lib',
             'idpf_common_rxtx_avx512.c',
-            dependencies: [static_rte_mbuf, static_rte_net_iavf],
+            dependencies: static_rte_mbuf,
             include_directories: includes,
             c_args: avx512_args)
     objs += idpf_common_avx512_lib.extract_objects('idpf_common_rxtx_avx512.c')
