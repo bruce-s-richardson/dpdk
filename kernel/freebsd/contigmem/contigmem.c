@@ -52,15 +52,19 @@ static d_close_t        contigmem_close;
 static int              contigmem_num_buffers = RTE_CONTIGMEM_DEFAULT_NUM_BUFS;
 static int64_t          contigmem_buffer_size = RTE_CONTIGMEM_DEFAULT_BUF_SIZE;
 static bool             contigmem_coredump_enable;
+static char             contigmem_socket_mem[256];
 
 static eventhandler_tag contigmem_eh_tag;
 static struct contigmem_buffer contigmem_buffers[RTE_CONTIGMEM_MAX_NUM_BUFS];
+static int              contigmem_allocated_bufs;
 static struct cdev     *contigmem_cdev = NULL;
 static int              contigmem_refcnt;
+
 
 TUNABLE_INT("hw.contigmem.num_buffers", &contigmem_num_buffers);
 TUNABLE_QUAD("hw.contigmem.buffer_size", &contigmem_buffer_size);
 TUNABLE_BOOL("hw.contigmem.coredump_enable", &contigmem_coredump_enable);
+TUNABLE_STR("hw.contigmem.socket_mem", contigmem_socket_mem, sizeof(contigmem_socket_mem));
 
 static SYSCTL_NODE(_hw, OID_AUTO, contigmem, CTLFLAG_RD, 0, "contigmem");
 
@@ -75,6 +79,8 @@ SYSCTL_BOOL(_hw_contigmem, OID_AUTO, coredump_enable, CTLFLAG_RD,
 
 static SYSCTL_NODE(_hw_contigmem, OID_AUTO, physaddr, CTLFLAG_RD, 0,
 	"physaddr");
+static SYSCTL_NODE(_hw_contigmem, OID_AUTO, domain, CTLFLAG_RD, 0,
+	"domain");
 
 MALLOC_DEFINE(M_CONTIGMEM, "contigmem", "contigmem(4) allocations");
 
@@ -114,16 +120,15 @@ static struct cdevsw contigmem_ops = {
 	.d_close        = contigmem_close,
 };
 
-static int
-contigmem_load(void)
+static int contigmem_load_buffers(struct domainset *ds)
 {
 	char index_string[8], description[32];
 	int  i, error = 0;
 	void *addr;
 
-	if (contigmem_num_buffers > RTE_CONTIGMEM_MAX_NUM_BUFS) {
-		printf("%d buffers requested is greater than %d allowed\n",
-				contigmem_num_buffers, RTE_CONTIGMEM_MAX_NUM_BUFS);
+	if (contigmem_num_buffers + contigmem_allocated_bufs > RTE_CONTIGMEM_MAX_NUM_BUFS) {
+		printf("%d buffers requested is greater than %d available\n",
+				contigmem_num_buffers, RTE_CONTIGMEM_MAX_NUM_BUFS - contigmem_allocated_bufs);
 		error = EINVAL;
 		goto error;
 	}
@@ -136,8 +141,10 @@ contigmem_load(void)
 		goto error;
 	}
 
-	for (i = 0; i < contigmem_num_buffers; i++) {
-		addr = contigmalloc(contigmem_buffer_size, M_CONTIGMEM, M_ZERO,
+	printf("Allocating %u buffers of size %lukB\n",
+			contigmem_num_buffers, contigmem_buffer_size / 1024);
+	for (i = contigmem_allocated_bufs; i < contigmem_num_buffers + contigmem_allocated_bufs; i++) {
+		addr = contigmalloc_domainset(contigmem_buffer_size, M_CONTIGMEM, ds, M_ZERO,
 			0, BUS_SPACE_MAXADDR, contigmem_buffer_size, 0);
 		if (addr == NULL) {
 			printf("contigmalloc failed for buffer %d\n", i);
@@ -161,6 +168,7 @@ contigmem_load(void)
 				(void *)(uintptr_t)i, 0, contigmem_physaddr, "LU",
 				description);
 	}
+	contigmem_allocated_bufs = i;
 
 	contigmem_cdev = make_dev_credf(0, &contigmem_ops, 0, NULL, UID_ROOT,
 			GID_WHEEL, 0600, "contigmem");
@@ -168,7 +176,8 @@ contigmem_load(void)
 	return 0;
 
 error:
-	for (i = 0; i < contigmem_num_buffers; i++) {
+	/* on error, unload all buffers */
+	for (i = 0; i < RTE_CONTIGMEM_MAX_NUM_BUFS; i++) {
 		if (contigmem_buffers[i].addr != NULL) {
 			contigfree(contigmem_buffers[i].addr,
 				contigmem_buffer_size, M_CONTIGMEM);
@@ -179,6 +188,95 @@ error:
 	}
 
 	return error;
+}
+
+/* handle strings of format N*X,M*Y,... 
+ * where N and M are counts,
+ * and X and Y are numbers with optional k,M,G suffixes
+ */
+static int contigmem_load_socket_mem(void)
+{
+	char *start = contigmem_socket_mem;
+	int socket = 0;
+
+	while (*start != '\0') {
+
+		/* check that we have a digit */
+		if (*start < '0' || *start > '9') {
+			printf("Unexpected character '%c' found at position %lu of hw.contigmem.socket_mem. Expected a digit\n",
+					*start, (uintptr_t)start - (uintptr_t)contigmem_socket_mem);
+			return EINVAL;
+		}
+
+		const unsigned long n = strtoul(start, &start, 0);
+		if (*start == '\0') {
+			printf("Unexpected end-of-string found at position %lu of hw.contigmem.socket_mem\n",
+					(uintptr_t)start - (uintptr_t)contigmem_socket_mem);
+			return EINVAL;
+		}
+
+		/* allow "0" on its own as an indicator of no data on socket */
+		if (n == 0 && (*start == ',' || *start == ';'))
+			goto next_socket;
+
+		if (*start != 'x' && *start != '*') {
+			printf("Unexpected character '%c' found at position %lu of hw.contigmem.socket_mem. Expected '*' or 'x'\n",
+					*start, (uintptr_t)start - (uintptr_t)contigmem_socket_mem);
+			return EINVAL;
+		}
+		start++;
+		/* check that we have a digit */
+		if (*start < '0' || *start > '9') {
+			printf("Unexpected character %c found at position %lu of hw.contigmem.socket_mem. Expected a digit\n",
+					*start, (uintptr_t)start - (uintptr_t)contigmem_socket_mem);
+			return EINVAL;
+		}
+
+		unsigned long size = strtoul(start, &start, 0);
+		switch (*start) {
+			case 'T': size *= 1024; /* fall-through */
+			case 'G': size *= 1024; /* fall-through */
+			case 'M': size *= 1024; /* fall-through */
+			case 'k': size *= 1024;
+				start++;
+				break;
+			default: break;
+		}
+		if (size < 2 * 1024 * 1024) {
+			printf("Invalid size %lu found at position %lu of hw.contigmem.socket_mem, need minimum 2 MB\n",
+					size, (uintptr_t)start - (uintptr_t)contigmem_socket_mem);
+			return EINVAL;
+		}
+		if (*start != '\0' && *start != ',' && *start != ';') {
+			printf("Unexpected character %c found at position %lu of hw.contigmem.socket_mem. Expected a ',' or ';'\n",
+					*start, (uintptr_t)start - (uintptr_t)contigmem_socket_mem);
+			return EINVAL;
+		}
+
+		/* now create 'n' contigmem blocks of size 'size' on socket 'socket' */
+		contigmem_num_buffers = n;
+		contigmem_buffer_size = size;
+		printf("Allocating buffers for socket %u\n", socket);
+		int ret = contigmem_load_buffers(DOMAINSET_PREF(socket));
+		if (ret != 0)
+			return ret;
+		contigmem_num_buffers = 0;
+		contigmem_buffer_size = 0;
+
+next_socket:
+		start++;
+		socket++;
+	}
+	return 0;
+}
+
+static int
+contigmem_load(void)
+{
+	return strlen(contigmem_socket_mem) != 0 ?
+			contigmem_load_socket_mem() :
+			contigmem_load_buffers(DOMAINSET_IL());
+
 }
 
 static int
